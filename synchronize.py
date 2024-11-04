@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 from hashlib import blake2b
 from shutil import copy2
+from itertools import repeat
 
 
 BLOCK_SIZE = 2**16
@@ -12,47 +13,17 @@ MAX_WORKERS = 20
 MINIMUM_INTERVAL = 5
 
 
-parser = argparse.ArgumentParser(description=
-    """
-    Performs one-way synchronization of the contents of two folders periodically. 
-    Contents of the input folder are replicated to the output folder. 
-    Any files in the output folder that are not present in the input folder will be deleted.
-    """
-)
-parser.add_argument(
-    "-i", "--input", 
-    help="input folder path", 
-    metavar="IN_PATH", required=True)
-parser.add_argument(
-    "-o", "--output", 
-    help="output folder path", 
-    metavar="OUT_PATH", required=True)
-parser.add_argument(
-    "-l", "--log", 
-    help="log file path", 
-    metavar="LOG_PATH", required=True)
-parser.add_argument(
-    "-p", "--period", 
-    help="synchronization interval in seconds", 
-    type=int, metavar="INTERVAL", required=True)
-
-args = parser.parse_args()
-
 # Configure logging
 logger = logging.getLogger("FileSync")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(levelname)s | %(asctime)s: %(message)s")
 
-file_handler = logging.FileHandler(args.log)
-file_handler.setFormatter(formatter)
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
-
-logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 
-def validate_args():
+def validate_args(args):
     if not os.path.isdir(args.input):
         print("Input path is not an existing directory")
         quit(1)
@@ -105,9 +76,9 @@ def walk_directory(path, files: list, dirs: list, rel_path=""):
                 logger.warning("File '%s' was moved, deleted or renamed during synchronization", entry.path)
 
 
-def copy_file(path):
-    from_path = os.path.join(args.input, path)
-    to_path = os.path.join(args.output, path)
+def copy_file(source, destination, path):
+    from_path = os.path.join(source, path)
+    to_path = os.path.join(destination, path)
     try:
         copy2(from_path, to_path)
         logger.info("Copied file '%s' to '%s'", from_path, to_path)
@@ -119,17 +90,17 @@ def copy_file(path):
         logger.warning("File '%s' was moved, deleted or renamed during synchronization", from_path)
 
 
-async def synchronize():
+def synchronize(source, replica):
     try:
         # Get input folder hashes and directories
         input_files = []
         input_dirs = []
-        walk_directory(args.input, input_files, input_dirs)
+        walk_directory(source, input_files, input_dirs)
 
         # Get output folder hashes and directories
         output_files = []
         output_dirs = []
-        walk_directory(args.output, output_files, output_dirs)
+        walk_directory(replica, output_files, output_dirs)
 
         input_hashes = dict()
         output_hashes = dict()
@@ -151,7 +122,7 @@ async def synchronize():
 
         # Copy directories from input to output
         for path in input_dirs:
-            full_path = os.path.join(args.output, path)
+            full_path = os.path.join(replica, path)
             if not os.path.isdir(full_path):
                 try:
                     os.mkdir(full_path)
@@ -163,7 +134,7 @@ async def synchronize():
         # Delete files in output that are not present in input
         for path in output_hashes.keys():
             if path not in input_hashes:
-                full_path = os.path.join(args.output, path)
+                full_path = os.path.join(replica, path)
                 try:
                     os.remove(full_path)
                     logger.info("Deleted file '%s'", full_path)
@@ -178,7 +149,7 @@ async def synchronize():
         # Iterating the list in reverse guarantees that innermost folders are deleted before their parents.
         for path in reversed(output_dirs):
             if path not in input_dirs:
-                full_path = os.path.join(args.output, path)
+                full_path = os.path.join(replica, path)
                 try:
                     os.rmdir(full_path)
                     logger.info("Deleted directory '%s'", full_path)
@@ -198,17 +169,52 @@ async def synchronize():
         
         # Copy files concurrently
         with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            ex.map(copy_file, to_copy)
+            ex.map(copy_file, repeat(source, len(to_copy)), 
+                   repeat(replica, len(to_copy)), to_copy)
     except KeyboardInterrupt:
         print("Exiting...")
         raise KeyboardInterrupt
 
 
+# async wrapper for synchronize function
+async def synchronize_wrapper(*args, **kwargs):
+    synchronize(*args, **kwargs)
+
+
 async def main():
-    validate_args()
+    parser = argparse.ArgumentParser(description=
+        """
+        Performs one-way synchronization of the contents of two folders periodically. 
+        Contents of the input folder are replicated to the output folder. 
+        Any files in the output folder that are not present in the input folder will be deleted.
+        """
+    )
+    parser.add_argument(
+        "-i", "--input", 
+        help="input folder path", 
+        metavar="IN_PATH", required=True)
+    parser.add_argument(
+        "-o", "--output", 
+        help="output folder path", 
+        metavar="OUT_PATH", required=True)
+    parser.add_argument(
+        "-l", "--log", 
+        help="log file path", 
+        metavar="LOG_PATH", required=True)
+    parser.add_argument(
+        "-p", "--period", 
+        help="synchronization interval in seconds", 
+        type=int, metavar="INTERVAL", required=True)
+
+    args = parser.parse_args()
+    validate_args(args)
+
+    file_handler = logging.FileHandler(args.log)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
     # perform initial synchronization
-    task = asyncio.create_task(synchronize())
+    task = asyncio.create_task(synchronize_wrapper(args.input, args.output))
 
     try:
         # synchronize periodically
@@ -216,7 +222,7 @@ async def main():
             await asyncio.sleep(args.period)
             # Only synchronize again if previous sync has already completed
             if task.done():
-                task = asyncio.create_task(synchronize())
+                task = asyncio.create_task(synchronize_wrapper(args.input, args.output))
             else:
                 logger.warning("""
                                 Syncronization was skipped because previous attempt was still running.
