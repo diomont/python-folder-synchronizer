@@ -20,6 +20,8 @@ A number of tests were written for the synchronization function, which use tempo
 
 To run the tests: `python -m pytest`
 
+Note that these tests do not test the program while running on the command line, only the synchronization function itself.
+
 ## Performance Considerations
 
 Performance takes a hit when handling files of considerable size. Synchronizing a very large sile is slower than multiple smaller ones.
